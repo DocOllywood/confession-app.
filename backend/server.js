@@ -1,4 +1,4 @@
-
+const mongoose = require('mongoose');
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -6,20 +6,37 @@ const rateLimit = require('express-rate-limit');
 const axios = require('axios');
 require('dotenv').config();
 const app = express();
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 5000;
 // In-memory database (replace with MongoDB/PostgreSQL in production)
-const confessions = new Map();
 const sentimentData = [];
-// Middleware
+// Database Connection
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log('✅ Connected to MongoDB Atlas'))
+  .catch(err => console.error('❌ MongoDB connection error:', err));
+
+// Confession Schema
+const confessionSchema = new mongoose.Schema({
+  sessionId: String,
+  ciphertext: String,
+  nonce: String,
+  timestamp: { type: Date, default: Date.now },
+  expiresAt: { type: Date, default: () => new Date(Date.now() + 72*60*60*1000), index: { expires: '72h' } }
+});
+
+const Confession = mongoose.model('Confession', confessionSchema);
+// Middleware//
 app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
+
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
+  max: 100, 
   message: 'Too many requests from this IP, please try again later.'
 });
+
 app.use('/api/', limiter);
 // Helper: Analyze sentiment (without storing plaintext)
 function analyzeSentimentMetrics(textLength, timestamp) {
@@ -32,49 +49,46 @@ function analyzeSentimentMetrics(textLength, timestamp) {
   };
 }
 // ROUTES
-// Submit encrypted confession
-app.post('/api/confess', (req, res) => {
+
+// Submit encrypted confession to MongoDB
+app.post('/api/confess', async (req, res) => {
   try {
     const { sessionId, ciphertext, nonce, timestamp } = req.body;
     if (!ciphertext || !nonce || !sessionId) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
-    const confessionId = `conf_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
-    const confession = {
-      id: confessionId,
+
+    const confession = new Confession({
       sessionId,
       ciphertext,
       nonce,
-      timestamp,
-      expiresAt: new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString(), // 72 hours
-      readCount: 0
-    };
-    confessions.set(confessionId, confession);
-    // Store anonymized metrics for researcher dashboard
-    sentimentData.push(analyzeSentimentMetrics(ciphertext.length, timestamp));
-    // Auto-delete after 72 hours
-    setTimeout(() => {
-      confessions.delete(confessionId);
-    }, 72 * 60 * 60 * 1000);
+      timestamp: timestamp || new Date()
+    });
+
+    await confession.save();
+    
+    sentimentData.push(analyzeSentimentMetrics(ciphertext.length, confession.timestamp));
+
     res.json({ 
-      id: confessionId,
-      message: 'Confession encrypted and stored securely'
+      id: confession._id, 
+      message: 'Confession encrypted and stored securely in MongoDB' 
     });
   } catch (error) {
     console.error('Error storing confession:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
-// Get encrypted confession (for reading)
-app.get('/api/confess/:id', (req, res) => {
+
+// Get encrypted confession from MongoDB
+app.get('/api/confess/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const confession = confessions.get(id);
+    const confession = await Confession.findById(id);
+    
     if (!confession) {
       return res.status(404).json({ error: 'Confession not found or already deleted' });
     }
-    // Return encrypted data (client decrypts)
+    
     res.json({
       ciphertext: confession.ciphertext,
       nonce: confession.nonce,
@@ -85,11 +99,12 @@ app.get('/api/confess/:id', (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
-// Delete confession (self-destruct after reading)
-app.delete('/api/confess/:id', (req, res) => {
+
+// Delete confession from MongoDB
+app.delete('/api/confess/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const deleted = confessions.delete(id);
+    const deleted = await Confession.findByIdAndDelete(id);
     if (deleted) {
       res.json({ message: 'Confession permanently deleted' });
     } else {
@@ -99,8 +114,7 @@ app.delete('/api/confess/:id', (req, res) => {
     console.error('Error deleting confession:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
-});
-// AI Response (Claude API) - Non-judgmental listener
+}); // AI Response (Claude API) - Non-judgmental listener
 app.post('/api/ai-respond', async (req, res) => {
   try {
     const { confessionId, sessionId } = req.body;
@@ -180,6 +194,7 @@ app.get('/api/research/crisis-alert', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
+
 app.listen(PORT, () => {
   console.log(`🔒 Secure confession server running on port ${PORT}`);
   console.log(`🌐 Backend ready for E2EE confessions`);
